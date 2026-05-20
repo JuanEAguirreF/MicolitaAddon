@@ -496,7 +496,7 @@ app.get('/manifest.json', (req, res) => {
 async function getDirectStreamM3u8(embedUrl) {
   if (process.env.RESOLVE_DIRECT_LINKS !== 'true') return null;
 
-  console.log(`[Micolita] Intentando resolver enlace directo usando Puppeteer para: ${embedUrl}`);
+  console.log(`[Micolita] [Resolver] Iniciando resolución para: ${embedUrl}`);
   let browser;
   try {
     let puppeteer;
@@ -504,7 +504,7 @@ async function getDirectStreamM3u8(embedUrl) {
       const pkg = 'puppeteer';
       puppeteer = require(pkg);
     } catch (e) {
-      console.error('[Micolita] Error cargando Puppeteer dinámicamente:', e.message);
+      console.error('[Micolita] [Resolver] Error cargando Puppeteer dinámicamente:', e.message);
       return null;
     }
 
@@ -517,8 +517,7 @@ async function getDirectStreamM3u8(embedUrl) {
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
         '--no-first-run',
-        '--no-zygote',
-        '--single-process'
+        '--no-zygote'
       ]
     };
     
@@ -526,7 +525,10 @@ async function getDirectStreamM3u8(embedUrl) {
       launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
     }
     
+    console.log(`[Micolita] [Resolver] Lanzando navegador Puppeteer...`);
     browser = await puppeteer.launch(launchOptions);
+    console.log(`[Micolita] [Resolver] Navegador lanzado con éxito. Creando página...`);
+    
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     
@@ -541,6 +543,7 @@ async function getDirectStreamM3u8(embedUrl) {
       
       if (url.includes('.m3u8') && !url.includes('adserver') && !url.includes('doubleclick') && !url.includes('analytics')) {
         m3u8Url = url;
+        console.log(`[Micolita] [Resolver] ¡Enlace .m3u8 detectado en peticiones de red! -> ${url.substring(0, 80)}...`);
       }
       
       const isAdOrTracker = url.includes('adserver') || 
@@ -561,7 +564,9 @@ async function getDirectStreamM3u8(embedUrl) {
     });
     
     // Navegación rápida (timeout de 8s)
+    console.log(`[Micolita] [Resolver] Navegando a la URL del embed...`);
     await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 8000 });
+    console.log(`[Micolita] [Resolver] Página cargada (domcontentloaded). Esperando enlace directo final...`);
     
     // Esperar máximo 4 segundos adicionales o hasta obtener el m3u8
     const startTime = Date.now();
@@ -569,16 +574,24 @@ async function getDirectStreamM3u8(embedUrl) {
       await new Promise(resolve => setTimeout(resolve, 150));
     }
     
+    if (m3u8Url) {
+      console.log(`[Micolita] [Resolver] Éxito: Enlace extraído correctamente.`);
+    } else {
+      console.log(`[Micolita] [Resolver] Falló: No se detectó ninguna petición de stream .m3u8 dentro de los límites de tiempo.`);
+    }
+    
     return m3u8Url;
   } catch (error) {
-    console.error(`[Micolita] Error resolviendo enlace directo con Puppeteer:`, error.message);
+    console.error(`[Micolita] [Resolver] Error en el proceso de Puppeteer:`, error.message);
     return null;
   } finally {
     if (browser) {
       try {
+        console.log(`[Micolita] [Resolver] Cerrando navegador...`);
         await browser.close();
+        console.log(`[Micolita] [Resolver] Navegador cerrado correctamente.`);
       } catch (err) {
-        // Ignorar
+        console.error(`[Micolita] [Resolver] Error al cerrar navegador:`, err.message);
       }
     }
   }
@@ -604,8 +617,13 @@ async function getCachedOrResolveM3u8(id, embedUrl) {
     if (url) {
       directLinkCache.set(id, { url, timestamp: Date.now() });
       console.log(`[Micolita] ¡Resolución completada! Enlace para ${id} guardado en caché.`);
+    } else {
+      console.log(`[Micolita] Resolución finalizada sin éxito para ${id}. No se encontró enlace directo.`);
     }
     return url;
+  }).catch(err => {
+    console.error(`[Micolita] Error en resolución en segundo plano para ${id}:`, err.message);
+    return null;
   });
 
   // Promesa de carrera rápida para cumplir con el estricto timeout de Stremio (3.5 segundos)
