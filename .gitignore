@@ -29,3 +29,9 @@ lerna-debug.log*
 # Archivos del sistema operativo
 .DS_Store
 Thumbs.db
+
+# Scripts de prueba locales y capturas
+inspect_turnstile.js
+test_resolver.js
+page.html
+screenshot*.png

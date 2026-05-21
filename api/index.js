@@ -501,11 +501,21 @@ async function getDirectStreamM3u8(embedUrl) {
   try {
     let puppeteer;
     try {
-      const pkg = 'puppeteer';
-      puppeteer = require(pkg);
+      const pkgExtra = 'puppeteer-extra';
+      const pkgStealth = 'puppeteer-extra-plugin-stealth';
+      puppeteer = require(pkgExtra);
+      const StealthPlugin = require(pkgStealth);
+      puppeteer.use(StealthPlugin());
+      console.log(`[Micolita] [Resolver] Utilizando puppeteer-extra + stealth plugin.`);
     } catch (e) {
-      console.error('[Micolita] [Resolver] Error cargando Puppeteer dinámicamente:', e.message);
-      return null;
+      console.log(`[Micolita] [Resolver] puppeteer-extra o stealth no disponibles, intentando puppeteer estándar:`, e.message);
+      try {
+        const pkg = 'puppeteer';
+        puppeteer = require(pkg);
+      } catch (err) {
+        console.error('[Micolita] [Resolver] Error cargando Puppeteer:', err.message);
+        return null;
+      }
     }
 
     const launchOptions = {
@@ -517,7 +527,10 @@ async function getDirectStreamM3u8(embedUrl) {
         '--disable-accelerated-2d-canvas',
         '--disable-gpu',
         '--no-first-run',
-        '--no-zygote'
+        '--no-zygote',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--window-size=1280,720'
       ]
     };
     
@@ -530,15 +543,20 @@ async function getDirectStreamM3u8(embedUrl) {
     console.log(`[Micolita] [Resolver] Navegador lanzado con éxito. Creando página...`);
     
     const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1280, height: 720 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+    
+    const embedOrigin = new URL(embedUrl).origin;
+    await page.setExtraHTTPHeaders({
+      'Referer': `${embedOrigin}/`,
+      'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+    });
     
     let m3u8Url = null;
     
     // Activar interceptación de red para bloquear recursos pesados y anuncios
-    // Esto acelera la carga de la página en un 80% y ahorra CPU/RAM
     await page.setRequestInterception(true);
     page.on('request', request => {
-      const type = request.resourceType();
       const url = request.url();
       
       if (url.includes('.m3u8') && !url.includes('adserver') && !url.includes('doubleclick') && !url.includes('analytics')) {
@@ -554,24 +572,39 @@ async function getDirectStreamM3u8(embedUrl) {
                             url.includes('pop') ||
                             url.includes('click') ||
                             url.includes('histats') ||
+                            url.includes('disable-devtool') ||
                             url.includes('stats');
                             
-      if (['image', 'stylesheet', 'font', 'media'].includes(type) || isAdOrTracker) {
+      if (isAdOrTracker) {
         request.abort();
       } else {
         request.continue();
       }
     });
     
-    // Navegación rápida (timeout de 8s)
+    // Navegación (timeout de 25s)
     console.log(`[Micolita] [Resolver] Navegando a la URL del embed...`);
-    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 8000 });
+    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     console.log(`[Micolita] [Resolver] Página cargada (domcontentloaded). Esperando enlace directo final...`);
     
-    // Esperar máximo 4 segundos adicionales o hasta obtener el m3u8
+    // Esperar y hacer click
     const startTime = Date.now();
-    while (!m3u8Url && (Date.now() - startTime < 4000)) {
-      await new Promise(resolve => setTimeout(resolve, 150));
+    let clickedPlay = false;
+    
+    while (!m3u8Url && (Date.now() - startTime < 15000)) {
+      const elapsed = Date.now() - startTime;
+      
+      if (elapsed > 4000 && !clickedPlay) {
+        clickedPlay = true;
+        console.log('[Micolita] [Resolver] Haciendo click en el centro de la pantalla para iniciar reproducción...');
+        try {
+          await page.mouse.click(640, 360);
+        } catch (clickErr) {
+          console.error('[Micolita] [Resolver] Error al hacer click:', clickErr.message);
+        }
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 200));
     }
     
     if (m3u8Url) {
