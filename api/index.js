@@ -634,44 +634,86 @@ async function getDirectStreamM3u8(embedUrl) {
 const directLinkCache = new Map();
 const CACHE_TTL = 3 * 60 * 60 * 1000; // Guardar los enlaces directos por 3 horas
 
-async function getCachedOrResolveM3u8(id, embedUrl) {
+// Map para registrar las promesas de resolución activas y evitar múltiples instancias concurrentes de Puppeteer
+const activeResolutions = new Map();
+
+async function resolveWithInternalTimeout(id, embedUrl) {
   const cached = directLinkCache.get(id);
   const now = Date.now();
   
   if (cached && (now - cached.timestamp < CACHE_TTL)) {
-    console.log(`[Micolita] Enlace directo para ${id} obtenido instantáneamente desde el caché.`);
+    console.log(`[Micolita] [/play] Enlace para ${id} obtenido de caché instantáneamente.`);
     return cached.url;
   }
-
-  console.log(`[Micolita] Enlace para ${id} no está en caché. Iniciando resolución en segundo plano...`);
   
-  // Lanzamos la promesa de resolución real
+  // Si ya se está resolviendo este ID, esperar a la misma promesa
+  if (activeResolutions.has(id)) {
+    console.log(`[Micolita] [/play] Ya existe una resolución activa para ${id}. Esperando a que termine...`);
+    return activeResolutions.get(id);
+  }
+  
+  console.log(`[Micolita] [/play] Enlace para ${id} no está en caché. Iniciando resolución en tiempo real...`);
+  
   const resolvePromise = getDirectStreamM3u8(embedUrl).then(url => {
+    activeResolutions.delete(id); // Limpiar registro de resoluciones activas
     if (url) {
       directLinkCache.set(id, { url, timestamp: Date.now() });
-      console.log(`[Micolita] ¡Resolución completada! Enlace para ${id} guardado en caché.`);
-    } else {
-      console.log(`[Micolita] Resolución finalizada sin éxito para ${id}. No se encontró enlace directo.`);
     }
     return url;
   }).catch(err => {
-    console.error(`[Micolita] Error en resolución en segundo plano para ${id}:`, err.message);
+    activeResolutions.delete(id); // Limpiar en caso de error
+    console.error(`[Micolita] [/play] Error resolviendo en tiempo real para ${id}:`, err.message);
     return null;
   });
-
-  // Promesa de carrera rápida para cumplir con el estricto timeout de Stremio (3.5 segundos)
-  const timeoutPromise = new Promise(resolve => setTimeout(() => resolve(null), 3500));
-
-  // Retorna lo primero que termine. Si es el timeout, responde inmediatamente con null,
-  // pero el proceso de Puppeteer sigue corriendo en segundo plano y guardará el enlace en caché para el próximo clic.
-  const result = await Promise.race([resolvePromise, timeoutPromise]);
   
-  if (!result) {
-    console.log(`[Micolita] La resolución de ${id} tardó más de 3.5s. Devolviendo respuesta rápida (la resolución continuará en segundo plano).`);
-  }
-  
-  return result;
+  activeResolutions.set(id, resolvePromise);
+  return resolvePromise;
 }
+
+// Ruta para redireccionar y reproducir películas directamente
+app.get('/play/movie/:id', async (req, res) => {
+  const cleanId = req.params.id;
+  const activeMirrors = await getActiveMirrors();
+  if (activeMirrors.length === 0) {
+    return res.status(404).send('No active mirrors found');
+  }
+  const primaryMirror = activeMirrors[0];
+  const embedUrl = `https://${primaryMirror.domain}/embed/movie/${cleanId}?ds_lang=es`;
+  
+  console.log(`[Micolita] [/play/movie] Solicitud de reproducción directa para película: ${cleanId}`);
+  
+  const directUrl = await resolveWithInternalTimeout(cleanId, embedUrl);
+  if (directUrl) {
+    console.log(`[Micolita] [/play/movie] Redireccionando a enlace directo: ${directUrl}`);
+    return res.redirect(302, directUrl);
+  } else {
+    console.log(`[Micolita] [/play/movie] Falló resolución directa. Redireccionando a embed externo como fallback.`);
+    return res.redirect(302, embedUrl);
+  }
+});
+
+// Ruta para redireccionar y reproducir series directamente
+app.get('/play/series/:imdbId/:season/:episode', async (req, res) => {
+  const { imdbId, season, episode } = req.params;
+  const cleanId = `${imdbId}:${season}:${episode}`;
+  const activeMirrors = await getActiveMirrors();
+  if (activeMirrors.length === 0) {
+    return res.status(404).send('No active mirrors found');
+  }
+  const primaryMirror = activeMirrors[0];
+  const embedUrl = `https://${primaryMirror.domain}/embed/tv/${imdbId}/${season}-${episode}?ds_lang=es`;
+  
+  console.log(`[Micolita] [/play/series] Solicitud de reproducción directa para serie: ${cleanId}`);
+  
+  const directUrl = await resolveWithInternalTimeout(cleanId, embedUrl);
+  if (directUrl) {
+    console.log(`[Micolita] [/play/series] Redireccionando a enlace directo: ${directUrl}`);
+    return res.redirect(302, directUrl);
+  } else {
+    console.log(`[Micolita] [/play/series] Falló resolución directa. Redireccionando a embed externo como fallback.`);
+    return res.redirect(302, embedUrl);
+  }
+});
 
 // Movie stream provider route
 app.get('/stream/movie/:id.json', async (req, res) => {
@@ -679,20 +721,18 @@ app.get('/stream/movie/:id.json', async (req, res) => {
   const activeMirrors = await getActiveMirrors();
   const streams = [];
 
-  // Si está activada la resolución en el VPS, intentamos obtener el m3u8 usando caché o resolución inteligente
+  // Si está activada la resolución en el VPS, siempre agregamos la opción DIRECT PLAY ⭐ mediante redireccionador
   if (process.env.RESOLVE_DIRECT_LINKS === 'true' && activeMirrors.length > 0) {
-    const primaryMirror = activeMirrors[0];
-    const embedUrl = `https://${primaryMirror.domain}/embed/movie/${cleanId}?ds_lang=es`;
-    const directUrl = await getCachedOrResolveM3u8(cleanId, embedUrl);
+    const host = req.get('host');
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const playUrl = `${protocol}://${host}/play/movie/${cleanId}`;
     
-    if (directUrl) {
-      streams.push({
-        name: `Micolita\nDIRECT PLAY ⭐`,
-        type: 'url',
-        title: `🎬 Reproducción Directa Nativa (TV/Chromecast)\n⚡ Servidor: VPS Contabo\n🌐 Calidad: Auto (m3u8)\n💬 Subs: Español (Auto)\n✅ Compatible con reproductor interno`,
-        url: directUrl
-      });
-    }
+    streams.push({
+      name: `Micolita\nDIRECT PLAY ⭐`,
+      type: 'url',
+      title: `🎬 Reproducción Directa Nativa (TV/Chromecast)\n⚡ Servidor: VPS Contabo\n🌐 Calidad: Auto (m3u8)\n💬 Subs: Español (Auto)\n✅ Compatible con reproductor interno (Carga en ~8s)`,
+      url: playUrl
+    });
   }
   
   // Agregar siempre los mirrors externos tradicionales como fallback
@@ -723,20 +763,18 @@ app.get('/stream/series/:id.json', async (req, res) => {
   const activeMirrors = await getActiveMirrors();
   const streams = [];
 
-  // Si está activada la resolución en el VPS, intentamos obtener el m3u8
+  // Si está activada la resolución en el VPS, agregamos la opción DIRECT PLAY ⭐ mediante redireccionador
   if (process.env.RESOLVE_DIRECT_LINKS === 'true' && activeMirrors.length > 0) {
-    const primaryMirror = activeMirrors[0];
-    const embedUrl = `https://${primaryMirror.domain}/embed/tv/${imdbId}/${season}-${episode}?ds_lang=es`;
-    const directUrl = await getCachedOrResolveM3u8(cleanId, embedUrl);
+    const host = req.get('host');
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const playUrl = `${protocol}://${host}/play/series/${imdbId}/${season}/${episode}`;
     
-    if (directUrl) {
-      streams.push({
-        name: `Micolita\nDIRECT PLAY ⭐`,
-        type: 'url',
-        title: `🎬 Reproducción Directa Nativa (TV/Chromecast)\n⚡ Servidor: VPS Contabo\n🌐 Temp. ${season} - Cap. ${episode}\n🌐 Calidad: Auto (m3u8)\n💬 Subs: Español (Auto)\n✅ Compatible con reproductor interno`,
-        url: directUrl
-      });
-    }
+    streams.push({
+      name: `Micolita\nDIRECT PLAY ⭐`,
+      type: 'url',
+      title: `🎬 Reproducción Directa Nativa (TV/Chromecast)\n⚡ Servidor: VPS Contabo\n🌐 Temp. ${season} - Cap. ${episode}\n🌐 Calidad: Auto (m3u8)\n💬 Subs: Español (Auto)\n✅ Compatible con reproductor interno (Carga en ~8s)`,
+      url: playUrl
+    });
   }
 
   // Agregar siempre los mirrors externos tradicionales como fallback
